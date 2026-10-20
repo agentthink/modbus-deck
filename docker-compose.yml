@@ -1,0 +1,236 @@
+# Development and demo stack: the app plus a Modbus slave simulator.
+#
+#   docker compose up --build
+#   open http://127.0.0.1:8000: a connection to the simulator and a demo window are
+#   preloaded from docker/demo-workspace.json.
+#
+# Connections and windows are saved after every change in the "modbus-studio-data"
+# volume and restored on restart. The demo workspace only seeds the first start; to go
+# back to it, delete the volume: docker compose down -v
+#
+# Between containers, use the service name as the host: "simulator", port 5020 (TCP)
+# or 5021 (RTU over TCP). 127.0.0.1 inside the app container is the app container
+# itself, not your PC and not the simulator. From Windows/macOS/Linux tools on the
+# host (e.g. another Modbus master) use 127.0.0.1:5020.
+#
+# Ports are published on 127.0.0.1 only. To reach the UI from other machines
+# (e.g. a gateway on the plant network), change the binding AND set
+# MODBUS_STUDIO_TOKEN.
+#
+# Optional profile "influxdb": InfluxDB 2 and Grafana, with the exporter configured
+# and a dashboard for the simulator (see docs/influxdb.md):
+#
+#   docker compose --profile influxdb up --build
+#   Grafana http://127.0.0.1:3000 (admin / modbus-studio), InfluxDB http://127.0.0.1:8086
+#
+# The credentials below are development defaults; set INFLUXDB_TOKEN,
+# INFLUXDB_PASSWORD and GRAFANA_PASSWORD (e.g. in a .env file) before exposing
+# anything, and GRAFANA_ANONYMOUS=false to require a login in Grafana.
+#
+# Optional profile "mqtt": Mosquitto, with the exporter configured to publish every
+# value (see docs/mqtt.md):
+#
+#   docker compose --profile mqtt up --build
+#   docker compose exec mosquitto mosquitto_sub -u modbus-studio -P modbus-studio -t 'modbus-studio/#' -v
+#
+# MQTT_USERNAME and MQTT_PASSWORD (default modbus-studio / modbus-studio) are the
+# broker's only account. Both profiles can run together.
+
+x-image: &image
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+  image: modbus-studio:dev
+
+x-influxdb-env: &influxdb-env
+  INFLUXDB_ORG: modbus-studio
+  INFLUXDB_BUCKET: modbus
+  INFLUXDB_TOKEN: ${INFLUXDB_TOKEN:-modbus-studio-dev-token}
+
+x-mqtt-env: &mqtt-env
+  MQTT_USERNAME: ${MQTT_USERNAME:-modbus-studio}
+  MQTT_PASSWORD: ${MQTT_PASSWORD:-modbus-studio}
+
+services:
+  modbus-studio:
+    <<: *image
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      MODBUS_STUDIO_TOKEN: ${MODBUS_STUDIO_TOKEN:-}
+      MODBUS_STUDIO_WORKSPACE: /etc/modbus-studio/workspace.json
+      MODBUS_STUDIO_STATE_FILE: /data/workspace.json
+      MODBUS_STUDIO_WRITE_LOG_FILE: /data/writes.jsonl
+    volumes:
+      - ./docker/demo-workspace.json:/etc/modbus-studio/workspace.json:ro
+      - modbus-studio-data:/data
+    depends_on:
+      simulator:
+        condition: service_healthy
+    # Serial adapters (Linux hosts only), see docs/rtu-linux.md:
+    # devices:
+    #   - /dev/ttyUSB0:/dev/ttyUSB0
+    restart: unless-stopped
+
+  simulator:
+    <<: *image
+    # Listen on all interfaces of the container: the app reaches it over the compose
+    # network and the published ports reach it from the host.
+    command:
+      ["modbus-studio-sim", "--host", "0.0.0.0", "--tcp-port", "5020", "--rtu-tcp-port", "5021"]
+    networks:
+      default:
+        # Also reachable under the command's name, an easy one to type by mistake.
+        aliases: [modbus-studio-sim]
+    ports:
+      - "127.0.0.1:5020:5020"
+      - "127.0.0.1:5021:5021"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import socket; socket.create_connection(('127.0.0.1', 5020), 2).close()"
+      interval: 30s
+      timeout: 3s
+      start_period: 30s
+      start_interval: 1s
+    restart: unless-stopped
+
+  # -- profile "influxdb" --------------------------------------------------------
+
+  influxdb:
+    image: influxdb:2.7.11
+    profiles: [influxdb]
+    environment:
+      # First start only: create the org, the bucket and the API token.
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: admin
+      DOCKER_INFLUXDB_INIT_PASSWORD: ${INFLUXDB_PASSWORD:-modbus-studio}
+      DOCKER_INFLUXDB_INIT_ORG: modbus-studio
+      DOCKER_INFLUXDB_INIT_BUCKET: modbus
+      DOCKER_INFLUXDB_INIT_RETENTION: 30d
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUXDB_TOKEN:-modbus-studio-dev-token}
+    ports:
+      - "127.0.0.1:8086:8086"
+    volumes:
+      - influxdb-data:/var/lib/influxdb2
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 30s
+      timeout: 3s
+      start_period: 30s
+      start_interval: 1s
+    restart: unless-stopped
+
+  # Points modbus-studio's exporter at InfluxDB, once (an exporter already set up,
+  # e.g. from the UI, is left alone).
+  influxdb-setup:
+    <<: *image
+    profiles: [influxdb]
+    command: ["python", "/etc/modbus-studio/configure_exporters.py", "influxdb"]
+    environment:
+      <<: *influxdb-env
+      MODBUS_STUDIO_URL: http://modbus-studio:8000
+      MODBUS_STUDIO_TOKEN: ${MODBUS_STUDIO_TOKEN:-}
+    volumes:
+      - ./docker/configure_exporters.py:/etc/modbus-studio/configure_exporters.py:ro
+    depends_on:
+      modbus-studio:
+        condition: service_healthy
+      influxdb:
+        condition: service_healthy
+    restart: "no"
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    profiles: [influxdb]
+    environment:
+      <<: *influxdb-env
+      # First start only (when the grafana-data volume is created); see docs/influxdb.md.
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-modbus-studio}
+      # Dashboards open without logging in (read-only); log in as admin to edit them.
+      # GRAFANA_ANONYMOUS=false requires a login.
+      GF_AUTH_ANONYMOUS_ENABLED: ${GRAFANA_ANONYMOUS:-true}
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/modbus-studio-simulator.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      influxdb:
+        condition: service_healthy
+      # Also lets `docker compose up --wait` accept that the setup container exits.
+      influxdb-setup:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 3s
+      start_period: 30s
+      start_interval: 1s
+    restart: unless-stopped
+
+  # -- profile "mqtt" ------------------------------------------------------------
+
+  # Points modbus-studio's MQTT exporter at Mosquitto, once (an exporter already set
+  # up, e.g. from the UI, is left alone). It only needs modbus-studio: the exporter
+  # connects by itself as soon as Mosquitto is up.
+  mqtt-setup:
+    <<: *image
+    profiles: [mqtt]
+    command: ["python", "/etc/modbus-studio/configure_exporters.py", "mqtt"]
+    environment:
+      <<: *mqtt-env
+      MODBUS_STUDIO_URL: http://modbus-studio:8000
+      MODBUS_STUDIO_TOKEN: ${MODBUS_STUDIO_TOKEN:-}
+    volumes:
+      - ./docker/configure_exporters.py:/etc/modbus-studio/configure_exporters.py:ro
+    depends_on:
+      modbus-studio:
+        condition: service_healthy
+    restart: "no"
+
+  mosquitto:
+    image: eclipse-mosquitto:2.0.20
+    profiles: [mqtt]
+    environment:
+      <<: *mqtt-env
+    # The password file is rewritten at every start, so changing MQTT_PASSWORD and
+    # recreating the container is enough.
+    command:
+      - sh
+      - -c
+      - |
+        install -m 600 -o mosquitto -g mosquitto /dev/null /mosquitto/passwd
+        mosquitto_passwd -b /mosquitto/passwd "$$MQTT_USERNAME" "$$MQTT_PASSWORD"
+        exec mosquitto -c /mosquitto/config/mosquitto.conf
+    ports:
+      - "127.0.0.1:1883:1883"
+    volumes:
+      - ./docker/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto-data:/mosquitto/data
+    depends_on:
+      # Also lets `docker compose up --wait` accept that the setup container exits.
+      mqtt-setup:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - mosquitto_sub -h 127.0.0.1 -u "$$MQTT_USERNAME" -P "$$MQTT_PASSWORD" -t '$$SYS/broker/version' -C 1 -W 3
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      start_interval: 1s
+    restart: unless-stopped
+
+volumes:
+  modbus-studio-data:
+  influxdb-data:
+  grafana-data:
+  mosquitto-data:

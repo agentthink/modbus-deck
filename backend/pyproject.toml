@@ -1,0 +1,101 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "modbus-studio"
+# From src/modbus_studio/__init__.py; release.yml checks the tag matches it.
+dynamic = ["version"]
+description = "Open-source Modbus master for polling, monitoring and testing Modbus TCP/RTU devices from the browser."
+readme = "README.md"
+license = "MIT"
+# A copy of the repository's LICENSE: hatchling only packs files inside backend/.
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "modbus-studio contributors" }]
+keywords = ["modbus", "modbus-tcp", "modbus-rtu", "scada", "plc", "industrial", "iot"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: Web Environment",
+    "Framework :: FastAPI",
+    "Intended Audience :: Manufacturing",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Hardware",
+    "Topic :: System :: Monitoring",
+]
+dependencies = [
+    "pymodbus[serial]>=3.16,<4",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    # InfluxDB exporter (HTTP API).
+    "httpx>=0.27",
+    # MQTT exporter.
+    "paho-mqtt>=2.1,<3",
+]
+
+[project.urls]
+Homepage = "https://github.com/electrolabopen/modbus-studio"
+Repository = "https://github.com/electrolabopen/modbus-studio.git"
+Issues = "https://github.com/electrolabopen/modbus-studio/issues"
+Changelog = "https://github.com/electrolabopen/modbus-studio/blob/main/CHANGELOG.md"
+Container = "https://github.com/electrolabopen/modbus-studio/pkgs/container/modbus-studio"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "types-pyserial>=3.5",
+]
+
+[project.scripts]
+modbus-studio = "modbus_studio.main:run"
+modbus-studio-sim = "modbus_studio.simulator:run"
+
+[tool.hatch.version]
+path = "src/modbus_studio/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/modbus_studio"]
+# The compiled frontend is copied into src/modbus_studio/static by the build
+# (`npm run build` in frontend/). It is git-ignored, hence "artifacts".
+artifacts = ["src/modbus_studio/static/**"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "README.md", "LICENSE", "pyproject.toml"]
+# The sdist carries the compiled UI too, so a wheel built from it has one.
+artifacts = ["src/modbus_studio/static/**"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning:pymodbus.*"]
+# Dump every thread's stack if a test hangs, instead of waiting silently.
+faulthandler_timeout = 60
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "ASYNC", "RUF"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+mypy_path = "src"
+packages = ["modbus_studio"]
+
+[[tool.mypy.overrides]]
+module = ["pymodbus.*"]
+ignore_missing_imports = true
